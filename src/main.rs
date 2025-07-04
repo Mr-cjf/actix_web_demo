@@ -4,6 +4,7 @@ use actix_web::{App, HttpServer};
 use route_codegen::generate_configure;
 use std::env;
 
+
 generate_configure!();
 
 #[actix_web::main]
