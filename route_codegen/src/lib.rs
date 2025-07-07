@@ -2,6 +2,8 @@ extern crate proc_macro;
 
 use proc_macro::TokenStream;
 use quote::quote;
+// 用于解析 Rust 源码为 AST
+use rayon::prelude::*;
 // 用于生成 Rust 代码的宏
 use std::collections::HashMap;
 // 解析 Cargo.toml 使用
@@ -14,8 +16,6 @@ use std::path::{Path, PathBuf};
 use syn::LitStr;
 // 用于解析属性中的字符串字面量
 use syn::{parse_file, ItemFn};
-// 用于解析 Rust 源码为 AST
-use rayon::prelude::*;
 // 并行迭代支持
 
 /// generate_configure 是一个过程宏，它会扫描整个项目和 workspace 成员中的路由函数，
@@ -57,20 +57,9 @@ pub fn generate_configure(_input: TokenStream) -> TokenStream {
     // 构建服务注册语句
     let services = functions.iter().map(|f| {
         let ident = syn::Ident::new(&f.name, proc_macro2::Span::call_site());
-
-        if let Some(ref doc) = f.doc_comment {
-            // 如果有文档注释，则将其添加到 service 注册语句上方
-            let lines: Vec<_> = doc.lines().map(|l| format!("// {}", l)).collect();
-            let comment = lines.join("\n");
-            quote! {
-                #comment
-                cfg.service(crate::handler::nation::#ident);
-            }
-        } else {
-            // 否则只添加标准的 service 注册语句
-            quote! {
-                cfg.service(crate::handler::nation::#ident);
-            }
+        // 否则只添加标准的 service 注册语句
+        quote! {
+            cfg.service(crate::handler::nation::#ident);
         }
     });
 
@@ -147,7 +136,8 @@ fn scan_project(manifest_dir: &str, result: &mut Vec<RouteFunction>) {
     let root_dir = main_or_lib_path.parent().unwrap_or(&src_path);
 
     // 排除主文件本身 + mod.rs
-    let file_name_to_exclude = main_or_lib_path.file_name()
+    let file_name_to_exclude = main_or_lib_path
+        .file_name()
         .and_then(|s| s.to_str())
         .map(|s| vec![s, "mod.rs"])
         .unwrap_or_else(|| vec!["mod.rs"]);
@@ -210,7 +200,11 @@ fn find_main_or_lib(src_path: &Path) -> Option<PathBuf> {
 }
 
 /// 递归扫描指定目录中的 .rs 源文件
-fn scan_directory<P: AsRef<Path>>(path: P, exclude_files: &[&str], result: &mut Vec<RouteFunction>) {
+fn scan_directory<P: AsRef<Path>>(
+    path: P,
+    exclude_files: &[&str],
+    result: &mut Vec<RouteFunction>,
+) {
     let path = path.as_ref();
     #[cfg(debug_assertions)]
     println!("📁 Scanning directory: {:?}", path);
@@ -302,10 +296,9 @@ fn process_item(item: &syn::Item, result: &mut Vec<RouteFunction>) {
 
 /// 表示一个发现的路由函数的信息
 struct RouteFunction {
-    name: String,             // 函数名称
-    method: String,           // HTTP 方法（如 get、post）
-    route_path: String,       // 路由路径（如 /api/test）
-    doc_comment: Option<String>, // 文档注释（如果有）
+    name: String,       // 函数名称
+    method: String,     // HTTP 方法（如 get、post）
+    route_path: String, // 路由路径（如 /api/test）
 }
 
 /// 支持的 HTTP 方法列表
@@ -325,17 +318,12 @@ const METHOD_MAP: &[(&str, &str)] = &[
 fn extract_route_info(fn_item: &ItemFn) -> Option<RouteFunction> {
     let mut method = None;
     let mut path = None;
-    let mut doc_comments = Vec::new();
 
     for attr in &fn_item.attrs {
         if is_route_attribute(attr) {
             if let Some((m, p)) = parse_route_attribute(attr) {
                 method = Some(m);
                 path = Some(p);
-            }
-        } else if attr.path().is_ident("doc") {
-            if let Some(comment) = parse_doc_comment(attr) {
-                doc_comments.push(comment);
             }
         }
     }
@@ -348,15 +336,12 @@ fn extract_route_info(fn_item: &ItemFn) -> Option<RouteFunction> {
         name,
         method,
         route_path,
-        doc_comment: (!doc_comments.is_empty()).then(|| doc_comments.join("\n")),
     })
 }
 
 /// 判断属性是否是 actix-web 支持的 HTTP 方法属性（如 #[get(...)]）
 fn is_route_attribute(attr: &syn::Attribute) -> bool {
-    METHOD_MAP
-        .iter()
-        .any(|&(k, _)| attr.path().is_ident(k))
+    METHOD_MAP.iter().any(|&(k, _)| attr.path().is_ident(k))
 }
 
 /// 解析路由属性宏的方法和路径
@@ -368,13 +353,6 @@ fn parse_route_attribute(attr: &syn::Attribute) -> Option<(String, String)> {
         .iter()
         .find(|&&(k, _)| k == key)
         .map(|&(_, v)| (v.to_string(), value))
-}
-
-/// 解析文档注释内容
-fn parse_doc_comment(attr: &syn::Attribute) -> Option<String> {
-    attr.parse_args::<LitStr>()
-        .ok()
-        .map(|lit_str| lit_str.value().trim_start_matches(' ').to_string())
 }
 
 /// 提取属性宏的标识符名称
