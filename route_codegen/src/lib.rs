@@ -2,75 +2,111 @@ extern crate proc_macro;
 
 use proc_macro::TokenStream;
 use quote::quote;
-// 用于解析 Rust 源码为 AST
 use rayon::prelude::*;
-// 用于生成 Rust 代码的宏
 use std::collections::HashMap;
-// 解析 Cargo.toml 使用
 use std::fs;
-// 文件系统操作
 use std::io::Read;
-// 文件读取
 use std::path::{Path, PathBuf};
-// 路径处理
 use syn::LitStr;
-// 用于解析属性中的字符串字面量
 use syn::{parse_file, ItemFn};
-// 并行迭代支持
 
 /// generate_configure 是一个过程宏，它会扫描整个项目和 workspace 成员中的路由函数，
 /// 然后自动生成 configure 函数来注册这些路由。
 ///
-/// 它是通过 #[proc_macro] 注册的过程宏，供其他模块使用：
-///
-/// ```rust
-/*use crate::generate_configure;
-
-
-generate_configure!();
-
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    unsafe {
-        env::set_var("RUST_LOG", "actix_web=info");
-    }
-    env_logger::init();
-
-    println!("Starting HTTP server at http://127.0.0.1:8080");
-
-    HttpServer::new(|| App::new().configure(configure))
-        .bind("127.0.0.1:8080")?
-        .run()
-        .await
-}*/
-
-/// ```
 #[proc_macro]
 pub fn generate_configure(_input: TokenStream) -> TokenStream {
     let functions = scan_crate_for_route_functions();
 
     println!("🔍 Found {} route functions", functions.len());
     for func in &functions {
-        println!(" - {} [{} {}]", func.name, func.method, func.route_path);
+        println!(
+            " - {} [{} {}] (module: {:?})",
+            func.name, func.method, func.route_path, func.module_prefix
+        );
     }
 
-    // 构建服务注册语句
-    let services = functions.iter().map(|f| {
-        let ident = syn::Ident::new(&f.name, proc_macro2::Span::call_site());
-        // 否则只添加标准的 service 注册语句
-        quote! {
-            cfg.service(crate::handler::nation::#ident);
-        }
-    });
+    let mut grouped: HashMap<Vec<String>, Vec<RouteFunction>> = HashMap::new();
+    for func in functions {
+        let module_segments: Vec<String> = func
+            .module_prefix
+            .split("::")
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
 
-    // 构建最终的 configure 函数代码
+        grouped.entry(module_segments).or_default().push(func);
+    }
+
+    let mut all_configure_fns = Vec::new();
+    let mut all_configure_calls = Vec::new();
+
+    for (module_path, funcs) in grouped {
+        let safe_mod_name = module_path.join("_");
+        let configure_ident = syn::Ident::new(
+            &format!("configure_{}", safe_mod_name),
+            proc_macro2::Span::call_site(),
+        );
+
+        let scope_name = module_path
+            .iter()
+            .skip(2)
+            .map(|s| s.as_str())
+            .collect::<Vec<&str>>()
+            .join("/");
+        let mod_scope = if scope_name.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", scope_name)
+        };
+
+        let services = funcs.iter().map(|f| {
+            let ident = syn::Ident::new(&f.name, proc_macro2::Span::call_site());
+
+            let mut segments =
+                syn::punctuated::Punctuated::<syn::PathSegment, syn::Token![::]>::new();
+            for s in f.module_prefix.split("::") {
+                let ident_segment = syn::Ident::new(s, proc_macro2::Span::call_site());
+                segments.push(syn::PathSegment::from(ident_segment));
+            }
+
+            quote! {
+                cfg.service(#segments::#ident);
+            }
+        });
+
+        let register_ident = syn::Ident::new(
+            &format!("register_{}", safe_mod_name),
+            proc_macro2::Span::call_site(),
+        );
+
+        let register_fn = quote! {
+            pub fn #register_ident(cfg: &mut actix_web::web::ServiceConfig) {
+                #(#services)*
+            }
+        };
+
+        let configure_fn = quote! {
+            pub fn #configure_ident(cfg: &mut actix_web::web::ServiceConfig) {
+                cfg.service(actix_web::web::scope(#mod_scope)
+                    .configure(#register_ident));
+            }
+        };
+
+        all_configure_fns.push(register_fn);
+        all_configure_fns.push(configure_fn);
+        all_configure_calls.push(configure_ident);
+    }
+
     let expanded = quote! {
+        #(#all_configure_fns)*
+
         pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
-            #(#services)*
+            #(
+                cfg.configure(#all_configure_calls);
+            )*
         }
     };
 
-    // 打印最终生成的代码字符串（用于调试）
     #[cfg(debug_assertions)]
     {
         let generated_code = expanded.to_string();
@@ -80,17 +116,14 @@ pub fn generate_configure(_input: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
-/// 扫描当前 crate 中所有的路由函数
 fn scan_crate_for_route_functions() -> Vec<RouteFunction> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
         .expect("CARGO_MANIFEST_DIR environment variable not found");
 
     let mut result = Vec::new();
 
-    // 先扫描主项目
     scan_project(&manifest_dir, &mut result);
 
-    // 再检查是否为 workspace，并扫描成员项目
     if let Some(workspace_config) = read_workspace_config(&manifest_dir) {
         if let Some(members) = workspace_config.members {
             let workspace_dir = PathBuf::from(&manifest_dir);
@@ -101,14 +134,13 @@ fn scan_crate_for_route_functions() -> Vec<RouteFunction> {
     result
 }
 
-/// 遍历 workspace 成员并扫描每个成员项目的源码
 fn scan_workspace_members(
     workspace_dir: PathBuf,
     members: Vec<String>,
     result: &mut Vec<RouteFunction>,
 ) {
     for member in members {
-        let member_dir = workspace_dir.join(member);
+        let member_dir = workspace_dir.join(&member);
         if !member_dir.exists() {
             continue;
         }
@@ -118,12 +150,12 @@ fn scan_workspace_members(
             continue;
         }
 
-        let member_manifest_dir = member_dir.to_str().unwrap().to_string();
-        scan_project(&member_manifest_dir, result);
+        if let Ok(member_manifest_dir) = member_dir.into_os_string().into_string() {
+            scan_project(&member_manifest_dir, result);
+        }
     }
 }
 
-/// 扫描指定项目的 src/ 目录下的所有路由函数
 fn scan_project(manifest_dir: &str, result: &mut Vec<RouteFunction>) {
     let src_path = PathBuf::from(manifest_dir).join("src");
 
@@ -132,10 +164,8 @@ fn scan_project(manifest_dir: &str, result: &mut Vec<RouteFunction>) {
         None => return,
     };
 
-    // 主文件所在目录
     let root_dir = main_or_lib_path.parent().unwrap_or(&src_path);
 
-    // 排除主文件本身 + mod.rs
     let file_name_to_exclude = main_or_lib_path
         .file_name()
         .and_then(|s| s.to_str())
@@ -145,13 +175,11 @@ fn scan_project(manifest_dir: &str, result: &mut Vec<RouteFunction>) {
     scan_directory(root_dir, &file_name_to_exclude[..], result);
 }
 
-// 读取 Cargo.toml 中的 workspace 配置
 #[derive(Debug)]
 struct WorkspaceConfig {
     members: Option<Vec<String>>,
 }
 
-/// 读取并解析当前项目的 Cargo.toml，提取其中的 workspace 配置
 fn read_workspace_config(manifest_dir: &str) -> Option<WorkspaceConfig> {
     use toml::Value;
 
@@ -167,12 +195,11 @@ fn read_workspace_config(manifest_dir: &str) -> Option<WorkspaceConfig> {
     let members_val = workspace_val.get("members")?;
 
     if let Some(Value::Array(members)) = Some(members_val) {
-        let mut members_vec = Vec::new();
-        for member in members {
-            if let Some(member_str) = member.as_str() {
-                members_vec.push(member_str.to_string());
-            }
-        }
+        let members_vec: Vec<String> = members
+            .iter()
+            .filter_map(|member| member.as_str().map(|s| s.to_string()))
+            .collect();
+
         return Some(WorkspaceConfig {
             members: if members_vec.is_empty() {
                 None
@@ -185,7 +212,6 @@ fn read_workspace_config(manifest_dir: &str) -> Option<WorkspaceConfig> {
     None
 }
 
-/// 查找项目入口文件 main.rs 或 lib.rs
 fn find_main_or_lib(src_path: &Path) -> Option<PathBuf> {
     let main_rs = src_path.join("main.rs");
     let lib_rs = src_path.join("lib.rs");
@@ -199,21 +225,17 @@ fn find_main_or_lib(src_path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// 递归扫描指定目录中的 .rs 源文件
 fn scan_directory<P: AsRef<Path>>(
     path: P,
     exclude_files: &[&str],
     result: &mut Vec<RouteFunction>,
 ) {
     let path = path.as_ref();
-    #[cfg(debug_assertions)]
-    println!("📁 Scanning directory: {:?}", path);
 
     if let Ok(entries) = fs::read_dir(path) {
-        let entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-
-        let local_results: Vec<_> = entries
-            .into_par_iter()
+        entries
+            .filter_map(|entry| entry.ok())
+            .par_bridge()
             .filter_map(|entry| {
                 let entry_path = entry.path();
                 let file_name = entry_path
@@ -237,71 +259,113 @@ fn scan_directory<P: AsRef<Path>>(
                 None
             })
             .flatten()
-            .collect();
-
-        result.extend(local_results);
+            .collect::<Vec<_>>()
+            .into_iter()
+            .for_each(|item| result.push(item));
     } else {
         eprintln!("❌ Failed to read directory: {:?}", path);
     }
 }
 
-/// 处理单个 .rs 文件，提取其中的路由函数信息
 fn process_file(path: &Path, result: &mut Vec<RouteFunction>) {
     if let Ok(content) = fs::read_to_string(path) {
-        #[cfg(debug_assertions)]
-        {
-            let first_100 = content.chars().take(100).collect::<String>();
-            println!("📄 File content (first 100 chars): {:?}", first_100);
-        }
-
-        scan_file(&content, result);
+        scan_file(&content, result, path);
     } else {
         eprintln!("❌ Failed to read file: {}", path.display());
     }
 }
 
-/// 将 Rust 源码字符串解析为抽象语法树（AST），并遍历其中的项
-fn scan_file(content: &str, result: &mut Vec<RouteFunction>) {
+fn scan_file(content: &str, result: &mut Vec<RouteFunction>, path: &Path) {
     let file = parse_file(content).expect("Failed to parse file content");
 
+    let mut current_module = vec![];
+
+    if let Some(file_name) = path.file_stem().and_then(|s| s.to_str()) {
+        if file_name != "mod" {
+            if !file
+                .items
+                .iter()
+                .any(|item| matches!(item, syn::Item::Mod(_)))
+            {
+                current_module.push(file_name.to_string());
+            }
+        }
+    }
+
     for item in file.items {
-        process_item(&item, result);
+        process_item_with_module(&item, result, &mut current_module, path);
     }
 }
 
-/// 处理 AST 中的每一项（函数或模块），尝试提取路由信息
-fn process_item(item: &syn::Item, result: &mut Vec<RouteFunction>) {
+fn process_item_with_module(
+    item: &syn::Item,
+    result: &mut Vec<RouteFunction>,
+    current_module: &mut Vec<String>,
+    path: &Path,
+) {
     match item {
-        syn::Item::Fn(fn_item) => {
-            if let Some(route_fn) = extract_route_info(fn_item) {
-                println!("✅ Found route function: {}", route_fn.name);
-                result.push(route_fn);
-            }
-        }
-        syn::Item::Mod(module) => {
-            if let Some((_, ref items)) = module.content {
-                for inner_item in items {
-                    if let syn::Item::Fn(fn_item) = inner_item {
-                        if let Some(route_fn) = extract_route_info(fn_item) {
-                            println!("✅ Found route function: {}", route_fn.name);
-                            result.push(route_fn);
-                        }
-                    }
-                }
-            }
-        }
+        syn::Item::Fn(fn_item) => handle_function(fn_item, result, current_module),
+        syn::Item::Mod(module) => handle_module(module, result, current_module, path),
         _ => {}
     }
 }
 
-/// 表示一个发现的路由函数的信息
-struct RouteFunction {
-    name: String,       // 函数名称
-    method: String,     // HTTP 方法（如 get、post）
-    route_path: String, // 路由路径（如 /api/test）
+fn handle_function(
+    fn_item: &ItemFn,
+    result: &mut Vec<RouteFunction>,
+    current_module: &mut Vec<String>,
+) {
+    let route_fn = match extract_route_info(fn_item) {
+        Some(route_fn) => route_fn,
+        None => return,
+    };
+
+    let module_prefix = build_module_prefix(current_module);
+
+    let mut fixed_route_fn = route_fn;
+    fixed_route_fn.module_prefix = module_prefix;
+
+    result.push(fixed_route_fn);
 }
 
-/// 支持的 HTTP 方法列表
+fn handle_module(
+    module: &syn::ItemMod,
+    result: &mut Vec<RouteFunction>,
+    current_module: &mut Vec<String>,
+    path: &Path,
+) {
+    let module_name = module.ident.to_string();
+
+    if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
+        if file_stem == module_name {
+            current_module.push(file_stem.to_string());
+        }
+    }
+
+    current_module.push(module_name.clone());
+
+    if let Some((_, ref items)) = module.content {
+        for inner in items {
+            process_item_with_module(inner, result, current_module, path);
+        }
+    }
+
+    current_module.pop();
+    if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
+        if file_stem == module_name {
+            current_module.pop();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RouteFunction {
+    name: String,
+    method: String,
+    route_path: String,
+    module_prefix: String,
+}
+
 const METHOD_MAP: &[(&str, &str)] = &[
     ("get", "get"),
     ("post", "post"),
@@ -314,7 +378,6 @@ const METHOD_MAP: &[(&str, &str)] = &[
     ("patch", "patch"),
 ];
 
-/// 提取函数上的方法属性（如 #[get(...)]）和文档注释
 fn extract_route_info(fn_item: &ItemFn) -> Option<RouteFunction> {
     let mut method = None;
     let mut path = None;
@@ -336,15 +399,20 @@ fn extract_route_info(fn_item: &ItemFn) -> Option<RouteFunction> {
         name,
         method,
         route_path,
+        module_prefix: String::new(),
     })
 }
 
-/// 判断属性是否是 actix-web 支持的 HTTP 方法属性（如 #[get(...)]）
 fn is_route_attribute(attr: &syn::Attribute) -> bool {
-    METHOD_MAP.iter().any(|&(k, _)| attr.path().is_ident(k))
+    METHOD_MAP.iter().any(|&(k, _)| {
+        attr.path().is_ident(k) || {
+            attr.path().segments.len() == 2
+                && attr.path().segments[0].ident == "actix_web"
+                && attr.path().segments[1].ident == k
+        }
+    })
 }
 
-/// 解析路由属性宏的方法和路径
 fn parse_route_attribute(attr: &syn::Attribute) -> Option<(String, String)> {
     let key = get_attr_key(attr)?;
     let attr_path = attr.parse_args::<LitStr>().ok()?;
@@ -355,7 +423,6 @@ fn parse_route_attribute(attr: &syn::Attribute) -> Option<(String, String)> {
         .map(|&(_, v)| (v.to_string(), value))
 }
 
-/// 提取属性宏的标识符名称
 fn get_attr_key(attr: &syn::Attribute) -> Option<String> {
     let segments: Vec<_> = attr.path().segments.iter().collect();
     if segments.len() == 1 {
@@ -363,4 +430,20 @@ fn get_attr_key(attr: &syn::Attribute) -> Option<String> {
         return Some(ident.to_lowercase());
     }
     None
+}
+
+fn build_module_prefix(current_module: &[String]) -> String {
+    if current_module.is_empty() {
+        return "crate::handler".to_string();
+    }
+
+    let mut prefix =
+        String::with_capacity(32 + current_module.iter().map(|s| s.len()).sum::<usize>());
+    prefix.push_str("crate::handler");
+
+    for seg in current_module {
+        prefix.push_str("::");
+        prefix.push_str(seg);
+    }
+    prefix
 }

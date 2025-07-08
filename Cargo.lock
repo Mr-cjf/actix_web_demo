@@ -1158,6 +1158,7 @@ checksum = "2b15c43186be67a4fd63bee50d0303afffcef381492ebe2c5d87f324e1b8815c"
 name = "route_codegen"
 version = "0.1.0"
 dependencies = [
+ "log",
  "proc-macro2",
  "quote",
  "rayon",
@@ -1524,6 +1525,7 @@ version = "0.1.0"
 dependencies = [
  "actix-web",
  "env_logger",
+ "log",
  "route_codegen",
 ]
 
