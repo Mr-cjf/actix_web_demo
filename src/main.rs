@@ -1,4 +1,3 @@
-mod api;
 pub mod handler;
 
 use actix_web::{App, HttpServer};
