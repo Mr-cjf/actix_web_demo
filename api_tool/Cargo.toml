@@ -1,0 +1,11 @@
+[package]
+name = "api_tool"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "api_tool"
+path = "src/lib.rs"
+
+[dependencies]
+actix-web = "4.11.0"

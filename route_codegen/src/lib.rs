@@ -57,6 +57,8 @@ pub fn generate_configure(_input: TokenStream) -> TokenStream {
     // 为每个模块生成 configure_xxx 函数
     let mut all_configure_fns = Vec::new();
     let mut all_configure_calls: Vec<syn::Ident> = Vec::new();
+    // 新增：收集所有路由信息用于一次性打印
+    let mut all_routes = Vec::new();
 
     for (module_path, funcs) in grouped {
         let safe_mod_name = module_path.join("_");
@@ -65,13 +67,26 @@ pub fn generate_configure(_input: TokenStream) -> TokenStream {
             proc_macro2::Span::call_site(),
         );
 
+        // 自定义映射函数：过滤掉不需要出现在 URL 中的模块名
+        fn map_module_segment(segment: &str) -> Option<&str> {
+            match segment {
+                "handler" | "api" | "api_tool" => None, // 这些模块名不应出现在 URL 中
+                _ => Some(segment),
+            }
+        }
+
         let scope_name = module_path
             .iter()
-            .skip(2)
-            .map(|s| s.as_str())
-            .collect::<Vec<&str>>()
+            .skip(1) // 跳过 crate/api_tool
+            .filter_map(|s| map_module_segment(s))
+            .collect::<Vec<_>>()
             .join("/");
-        let mod_scope = format!("/{}", scope_name);
+
+        let mod_scope = if scope_name.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", scope_name)
+        };
 
         let services = funcs.iter().map(|f| {
             let ident = syn::Ident::new(&f.name, proc_macro2::Span::call_site());
@@ -94,14 +109,11 @@ pub fn generate_configure(_input: TokenStream) -> TokenStream {
             }
         });
 
-        // 👇 插入日志打印语句在这里
-        let log_statements = funcs.iter().map(|f| {
+        // 收集路由信息
+        for f in &funcs {
             let full_path = format!("{}{}", mod_scope, f.route_path);
-            let method = f.method.to_uppercase();
-            quote! {
-                log::info!("🚀 Registered route: {} {}", #method, #full_path);
-            }
-        });
+            all_routes.push((f.method.to_uppercase(), full_path));
+        }
 
         let register_ident = syn::Ident::new(
             &format!("register_{}", safe_mod_name),
@@ -112,7 +124,6 @@ pub fn generate_configure(_input: TokenStream) -> TokenStream {
         let register_fn = quote! {
             pub fn #register_ident(cfg: &mut actix_web::web::ServiceConfig) {
                 #(#services)*
-                #(#log_statements)*
             }
         };
 
@@ -128,11 +139,29 @@ pub fn generate_configure(_input: TokenStream) -> TokenStream {
         all_configure_calls.push(configure_ident);
     }
 
+    // 创建路由日志的迭代器
+    let route_logs = all_routes.iter().map(|(method, path)| {
+        quote! {
+            log::info!("🚀 Registered route: {} {}", #method, #path);
+        }
+    });
+
     // 构建总入口 configure 函数
     let expanded = quote! {
         #(#all_configure_fns)*
 
         pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
+            // 一次性打印所有路由信息
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+                // 确保只打印一次
+                if INITIALIZED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                    #(#route_logs)*
+                }
+            }
+
             #(
                 cfg.configure(#all_configure_calls);
             )*
@@ -155,10 +184,10 @@ fn scan_crate_for_route_functions() -> Vec<RouteFunction> {
 
     let mut result = Vec::new();
 
-    // 先扫描主项目
-    scan_project(&manifest_dir, &mut result);
+    // 扫描主项目，使用 "crate" 作为根
+    scan_project(&manifest_dir, "crate", &mut result);
 
-    // 再检查是否为 workspace，并扫描成员项目
+    // 扫描工作空间成员
     if let Some(workspace_config) = read_workspace_config(&manifest_dir) {
         if let Some(members) = workspace_config.members {
             let workspace_dir = PathBuf::from(&manifest_dir);
@@ -176,7 +205,7 @@ fn scan_workspace_members(
     result: &mut Vec<RouteFunction>,
 ) {
     for member in members {
-        let member_dir = workspace_dir.join(member);
+        let member_dir = workspace_dir.join(&member);
         if !member_dir.exists() {
             continue;
         }
@@ -186,13 +215,30 @@ fn scan_workspace_members(
             continue;
         }
 
-        let member_manifest_dir = member_dir.to_str().unwrap().to_string();
-        scan_project(&member_manifest_dir, result);
+        // 读取成员项目的包名
+        if let Some(package_name) = read_package_name(&member_manifest_path) {
+            let member_manifest_dir = member_dir.to_str().unwrap().to_string();
+            scan_project(&member_manifest_dir, &package_name, result);
+        }
     }
 }
 
+// 新增函数：读取 Cargo.toml 中的包名
+fn read_package_name(manifest_path: &Path) -> Option<String> {
+    use toml::Value;
+
+    let mut file = fs::File::open(manifest_path).ok()?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).ok()?;
+
+    let cargo_toml: HashMap<String, Value> = toml::from_str(&contents).ok()?;
+    let package = cargo_toml.get("package")?;
+    let name = package.get("name")?.as_str()?;
+    Some(name.to_string())
+}
+
 /// 扫描指定项目的 src/ 目录下的所有路由函数
-fn scan_project(manifest_dir: &str, result: &mut Vec<RouteFunction>) {
+fn scan_project(manifest_dir: &str, crate_root: &str, result: &mut Vec<RouteFunction>) {
     let src_path = PathBuf::from(manifest_dir).join("src");
 
     let main_or_lib_path = match find_main_or_lib(&src_path) {
@@ -207,10 +253,41 @@ fn scan_project(manifest_dir: &str, result: &mut Vec<RouteFunction>) {
     let file_name_to_exclude = main_or_lib_path
         .file_name()
         .and_then(|s| s.to_str())
-        .map(|s| vec![s, "mod.rs"])
-        .unwrap_or_else(|| vec!["mod.rs"]);
+        .map(|s| vec![s.to_string(), "mod.rs".to_string()])
+        .unwrap_or_else(|| vec!["mod.rs".to_string()]);
 
-    scan_directory(root_dir, &file_name_to_exclude[..], result);
+    // 计算基础模块路径
+    let base_module_path = if crate_root == "crate" {
+        let relative_path = root_dir.strip_prefix(&src_path).unwrap_or(root_dir);
+        let mut base = "crate".to_string();
+        for comp in relative_path.components() {
+            if let std::path::Component::Normal(name) = comp {
+                base.push_str("::");
+                base.push_str(name.to_str().unwrap());
+            }
+        }
+        base
+    } else {
+        let relative_path = root_dir.strip_prefix(&src_path).unwrap_or(root_dir);
+        let mut base = crate_root.to_string(); // ✅ 正确写法
+        for comp in relative_path.components() {
+            if let std::path::Component::Normal(name) = comp {
+                base.push_str("::");
+                base.push_str(name.to_str().unwrap());
+            }
+        }
+        base
+    };
+
+    scan_directory(
+        root_dir,
+        &file_name_to_exclude
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>(),
+        &base_module_path,
+        result,
+    );
 }
 
 // 读取 Cargo.toml 中的 workspace 配置
@@ -271,6 +348,7 @@ fn find_main_or_lib(src_path: &Path) -> Option<PathBuf> {
 fn scan_directory<P: AsRef<Path>>(
     path: P,
     exclude_files: &[&str],
+    base_module_path: &str,
     result: &mut Vec<RouteFunction>,
 ) {
     let path = path.as_ref();
@@ -293,12 +371,19 @@ fn scan_directory<P: AsRef<Path>>(
                     let ext = entry_path.extension().and_then(|s| s.to_str());
                     if ext == Some("rs") && !exclude_files.contains(&file_name) {
                         let mut sub_result = Vec::new();
-                        process_file(&entry_path, &mut sub_result);
+                        // 修复1：添加 base_module_path 参数
+                        process_file(&entry_path, base_module_path, &mut sub_result);
                         return Some(sub_result);
                     }
                 } else if entry_path.is_dir() {
                     let mut sub_result = Vec::new();
-                    scan_directory(&entry_path, exclude_files, &mut sub_result);
+                    // 修复2：添加 base_module_path 参数
+                    scan_directory(
+                        &entry_path,
+                        exclude_files,
+                        base_module_path, // 传递 base_module_path
+                        &mut sub_result,
+                    );
                     return Some(sub_result);
                 }
 
@@ -314,36 +399,38 @@ fn scan_directory<P: AsRef<Path>>(
 }
 
 /// 处理单个 .rs 文件，提取其中的路由函数信息
-fn process_file(path: &Path, result: &mut Vec<RouteFunction>) {
+fn process_file(path: &Path, base_module_path: &str, result: &mut Vec<RouteFunction>) {
     if let Ok(content) = fs::read_to_string(path) {
-        scan_file(&content, result, path);
-    } else {
-        eprintln!("❌ Failed to read file: {}", path.display());
-    }
-}
+        let mut current_module = base_module_path
+            .split("::")
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect::<Vec<String>>();
 
-/// 将 Rust 源码字符串解析为抽象语法树（AST），并遍历其中的项
-fn scan_file(content: &str, result: &mut Vec<RouteFunction>, path: &Path) {
-    let file = parse_file(content).expect("Failed to parse file content");
+        // 获取文件名（如 user.rs）
+        if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
+            if file_stem != "mod" && file_stem != "main" && file_stem != "lib" {
+                // 获取父目录名称（如 src/api/user.rs → user）
+                if let Some(parent) = path
+                    .parent()
+                    .and_then(|p| p.file_stem().and_then(|s| s.to_str()))
+                {
+                    current_module.push(parent.to_string());
+                }
 
-    let mut current_module = vec![];
-
-    // 如果是 mod.rs 文件，则跳过自动推导模块名
-    if let Some(file_name) = path.file_stem().and_then(|s| s.to_str()) {
-        if file_name != "mod" {
-            // 只有在不是嵌套模块的情况下才推导文件名为顶层模块名
-            if !file
-                .items
-                .iter()
-                .any(|item| matches!(item, syn::Item::Mod(_)))
-            {
-                current_module.push(file_name.to_string());
+                // 添加当前文件名作为模块名
+                current_module.push(file_stem.to_string());
             }
         }
-    }
 
-    for item in file.items {
-        process_item_with_module(&item, result, &mut current_module, path);
+        for item in parse_file(&content)
+            .expect("Failed to parse file content")
+            .items
+        {
+            process_item_with_module(&item, result, &mut current_module, path);
+        }
+    } else {
+        eprintln!("❌ Failed to read file: {}", path.display());
     }
 }
 
@@ -371,7 +458,7 @@ fn handle_function(
         None => return,
     };
 
-    // 强制使用 current_module 栈来构建模块前缀
+    // 构建模块前缀
     let module_prefix = build_module_prefix(current_module);
 
     let mut fixed_route_fn = route_fn;
@@ -400,7 +487,7 @@ fn handle_module(
         }
     }
 
-    // 再推入模块名（支持嵌套，例如 crate::handler::agency::agency）
+    // 再推入模块名（支持嵌套，例如 crate::handler::agency）
     current_module.push(module_name.clone());
 
     println!(
@@ -417,6 +504,7 @@ fn handle_module(
 
     // Pop 模块名
     current_module.pop();
+
     // 如果是 agency.rs 的顶层模块，再 pop 掉文件名
     if let Some(file_stem) = current_file_stem {
         if file_stem == module_name {
@@ -512,11 +600,10 @@ fn get_attr_key(attr: &syn::Attribute) -> Option<String> {
 
 /// 构建模块前缀字符串
 fn build_module_prefix(current_module: &[String]) -> String {
-    let mut prefix = "crate::handler".to_string();
-
-    for seg in current_module {
-        prefix.push_str("::");
-        prefix.push_str(seg);
+    if current_module.is_empty() {
+        return String::new();
     }
-    prefix
+
+    // 直接使用当前模块栈构建路径
+    current_module.join("::")
 }

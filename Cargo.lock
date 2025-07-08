@@ -275,6 +275,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "api_tool"
+version = "0.1.0"
+dependencies = [
+ "actix-web",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1524,6 +1531,7 @@ name = "web_demo"
 version = "0.1.0"
 dependencies = [
  "actix-web",
+ "api_tool",
  "env_logger",
  "log",
  "route_codegen",

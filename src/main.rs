@@ -1,5 +1,5 @@
+pub mod api;
 pub mod handler;
-
 use actix_web::{App, HttpServer};
 use route_codegen::generate_configure;
 
