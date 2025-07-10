@@ -1,9 +1,14 @@
 extern crate proc_macro;
 
 // 导入函数
+mod configure_builder;
 mod tools;
+
+// 路径处理
+use crate::configure_builder::{
+    build_configure_function, generate_configure_functions_and_routes, group_functions_by_module,
+};
 use proc_macro::TokenStream;
-use quote::quote;
 // 用于解析 Rust 源码为 AST
 use rayon::prelude::*;
 // 用于生成 Rust 代码的宏
@@ -14,11 +19,9 @@ use std::fs;
 use std::io::Read;
 // 文件读取
 use std::path::{Path, PathBuf};
+use syn::LitStr;
 // 用于解析属性中的字符串字面量
 use syn::{parse_file, ItemFn};
-// 路径处理
-use syn::{LitStr, PathSegment, Token};
-use tools::is_rust_keyword;
 // 并行迭代支持
 
 /// generate_configure 是一个过程宏，它会扫描整个项目和 workspace 成员中的路由函数，
@@ -51,159 +54,6 @@ pub fn generate_configure(_input: TokenStream) -> TokenStream {
     }
 
     TokenStream::from(expanded)
-}
-
-/// 按模块路径分组
-fn group_functions_by_module(
-    functions: &[RouteFunction],
-) -> HashMap<Vec<String>, Vec<RouteFunction>> {
-    let mut grouped: HashMap<Vec<String>, Vec<RouteFunction>> = HashMap::new();
-    for func in functions {
-        let module_segments: Vec<String> = func
-            .module_prefix
-            .split("::")
-            .map(|s| s.to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        grouped
-            .entry(module_segments)
-            .or_insert_with(Vec::new)
-            .push(func.clone());
-    }
-    grouped
-}
-
-/// 生成 configure_xxx 和 register_xxx 函数及路由信息
-fn generate_configure_functions_and_routes(
-    grouped: HashMap<Vec<String>, Vec<RouteFunction>>,
-) -> (
-    Vec<proc_macro2::TokenStream>,
-    Vec<syn::Ident>,
-    Vec<(String, String)>,
-) {
-    let mut all_configure_fns = Vec::new();
-    let mut all_configure_calls = Vec::new();
-    let mut all_routes = Vec::new();
-
-    for (module_path, functions) in grouped {
-        let (configure_fn, register_fn, calls, routes) =
-            generate_module_configure(&module_path, &functions);
-        all_configure_fns.push(register_fn);
-        all_configure_fns.push(configure_fn);
-        all_configure_calls.extend(calls);
-        all_routes.extend(routes);
-    }
-
-    (all_configure_fns, all_configure_calls, all_routes)
-}
-
-/// 为每个模块生成 configure/register 函数及相关内容
-fn generate_module_configure(
-    module_path: &[String],
-    functions: &[RouteFunction],
-) -> (
-    proc_macro2::TokenStream,
-    proc_macro2::TokenStream,
-    Vec<syn::Ident>,
-    Vec<(String, String)>,
-) {
-    let safe_mod_name = module_path.join("_");
-    let configure_ident = syn::Ident::new(
-        &format!("configure_{}", safe_mod_name),
-        proc_macro2::Span::call_site(),
-    );
-
-    let scope_name = module_path.join("/");
-    let mod_scope = if scope_name.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{}", scope_name)
-    };
-
-    let services = functions.iter().map(|f| {
-        let ident = syn::Ident::new(&f.name, proc_macro2::Span::call_site());
-
-        let mut segments = syn::punctuated::Punctuated::<PathSegment, Token![::]>::new();
-        for s in f.module_prefix.split("::") {
-            let ident_segment = if is_rust_keyword(s) {
-                syn::parse_str::<syn::Ident>(&format!("r#{}", s))
-                    .expect("Failed to parse raw identifier")
-            } else {
-                syn::parse_str::<syn::Ident>(s).expect("Failed to parse identifier")
-            };
-            let path_segment = syn::PathSegment::from(ident_segment);
-            segments.push(path_segment);
-        }
-
-        quote! {
-            cfg.service(#segments::#ident);
-        }
-    });
-
-    let register_ident = syn::Ident::new(
-        &format!("register_{}", safe_mod_name),
-        proc_macro2::Span::call_site(),
-    );
-
-    let register_fn = quote! {
-        pub fn #register_ident(cfg: &mut actix_web::web::ServiceConfig) {
-            #(#services)*
-        }
-    };
-
-    let configure_fn = quote! {
-        pub fn #configure_ident(cfg: &mut actix_web::web::ServiceConfig) {
-            cfg.service(actix_web::web::scope(#mod_scope)
-                .configure(#register_ident));
-        }
-    };
-
-    let routes = functions
-        .iter()
-        .map(|f| {
-            (
-                f.method.to_uppercase(),
-                format!("{}{}", mod_scope, f.route_path),
-            )
-        })
-        .collect();
-
-    (configure_fn, register_fn, vec![configure_ident], routes)
-}
-
-/// 构建最终的 configure 函数
-fn build_configure_function(
-    all_configure_fns: Vec<proc_macro2::TokenStream>,
-    all_configure_calls: Vec<syn::Ident>,
-    all_routes: Vec<(String, String)>,
-) -> proc_macro2::TokenStream {
-    let route_logs = all_routes.iter().map(|(method, path)| {
-        quote! {
-            log::info!("🚀 Registered route: {} {}", #method, #path);
-        }
-    });
-
-    let configure_all = quote! {
-        #(#all_configure_fns)*
-
-        pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
-            {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static INITIALIZED: AtomicBool = AtomicBool::new(false);
-
-                if INITIALIZED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                    #(#route_logs)*
-                }
-            }
-
-            #(
-                cfg.configure(#all_configure_calls);
-            )*
-        }
-    };
-
-    configure_all
 }
 
 /// 扫描当前 crate 中所有的路由函数
