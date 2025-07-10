@@ -68,17 +68,10 @@ pub fn generate_configure(_input: TokenStream) -> TokenStream {
         );
 
         // 自定义映射函数：过滤掉不需要出现在 URL 中的模块名
-        fn map_module_segment(segment: &str) -> Option<&str> {
-            match segment {
-                "crate" => None, // 这些模块名不应出现在 URL 中
-                _ => Some(segment),
-            }
-        }
 
         let scope_name = module_path
             .iter()
-            .skip(1) // 跳过 crate/api_tool
-            .filter_map(|s| map_module_segment(s))
+            .map(|s| s.to_string())
             .collect::<Vec<_>>()
             .join("/");
 
@@ -91,10 +84,16 @@ pub fn generate_configure(_input: TokenStream) -> TokenStream {
         let services = funcs.iter().map(|f| {
             let ident = syn::Ident::new(&f.name, proc_macro2::Span::call_site());
 
-            // 构造模块路径
+            // 构造模块路径，并处理关键字
             let mut segments = syn::punctuated::Punctuated::new();
             for s in f.module_prefix.split("::") {
-                let ident_segment = syn::Ident::new(s, proc_macro2::Span::call_site());
+                // 使用 parse_str 构造合法的 Ident
+                let ident_segment = if is_rust_keyword(s) {
+                    syn::parse_str::<syn::Ident>(&format!("r#{}", s))
+                        .expect("Failed to parse raw identifier")
+                } else {
+                    syn::parse_str::<syn::Ident>(s).expect("Failed to parse identifier")
+                };
                 let path_segment = syn::PathSegment::from(ident_segment);
                 segments.push(path_segment);
             }
@@ -249,12 +248,10 @@ fn scan_project(manifest_dir: &str, crate_root: &str, result: &mut Vec<RouteFunc
     // 主文件所在目录
     let root_dir = main_or_lib_path.parent().unwrap_or(&src_path);
 
-    // 排除主文件本身 + mod.rs
-    let file_name_to_exclude = main_or_lib_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(|s| vec![s.to_string(), "mod.rs".to_string()])
-        .unwrap_or_else(|| vec!["mod.rs".to_string()]);
+    match find_main_or_lib(&src_path) {
+        Some(path) => path,
+        None => return,
+    };
 
     // 计算基础模块路径
     let base_module_path = if crate_root == "crate" {
@@ -279,15 +276,7 @@ fn scan_project(manifest_dir: &str, crate_root: &str, result: &mut Vec<RouteFunc
         base
     };
 
-    scan_directory(
-        root_dir,
-        &file_name_to_exclude
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>(),
-        &base_module_path,
-        result,
-    );
+    scan_directory(root_dir, &[], &base_module_path, result);
 }
 
 // 读取 Cargo.toml 中的 workspace 配置
@@ -401,7 +390,6 @@ fn scan_directory<P: AsRef<Path>>(
 /// 处理单个 .rs 文件，提取其中的路由函数信息
 fn process_file(path: &Path, base_module_path: &str, result: &mut Vec<RouteFunction>) {
     if let Ok(content) = fs::read_to_string(path) {
-        // 构建 current_module：base + 文件路径中除 src/ 以外的所有组件
         let mut current_module: Vec<String> = base_module_path
             .split("::")
             .filter(|s| !s.is_empty())
@@ -420,7 +408,7 @@ fn process_file(path: &Path, base_module_path: &str, result: &mut Vec<RouteFunct
         for component in relative_path.parent().unwrap_or(relative_path).components() {
             if let std::path::Component::Normal(name) = component {
                 let name_str = name.to_str().unwrap();
-                if name_str != "mod" && name_str != "lib" && name_str != "main" {
+                if name_str != "main" {
                     current_module.push(name_str.to_string());
                 }
             }
@@ -428,12 +416,12 @@ fn process_file(path: &Path, base_module_path: &str, result: &mut Vec<RouteFunct
 
         // 添加当前文件名作为模块名（排除 main.rs / lib.rs / mod.rs）
         if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
+            // 如果是 lib.rs 或 main.rs，则不再添加文件名为模块名
             if file_stem != "main" && file_stem != "lib" {
                 current_module.push(file_stem.to_string());
             }
         }
 
-        // 处理项
         for item in parse_file(&content)
             .expect("Failed to parse file content")
             .items
@@ -611,10 +599,65 @@ fn get_attr_key(attr: &syn::Attribute) -> Option<String> {
 
 /// 构建模块前缀字符串
 fn build_module_prefix(current_module: &[String]) -> String {
-    if current_module.is_empty() {
-        return String::new();
-    }
+    let filtered: Vec<&str> = current_module
+        .iter()
+        .filter(|s| !matches!(s.as_str(), "crate" | "mod"))
+        .map(String::as_str)
+        .collect();
+    filtered.join("::")
+}
 
-    // 直接使用当前模块栈构建路径
-    current_module.join("::")
+fn is_rust_keyword(s: &str) -> bool {
+    matches!(
+        s,
+        "as" | "break"
+            | "const"
+            | "continue"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "fn"
+            | "for"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "pub"
+            | "ref"
+            | "return"
+            | "self"
+            | "Self"
+            | "static"
+            | "struct"
+            | "super"
+            | "trait"
+            | "true"
+            | "type"
+            | "unsafe"
+            | "use"
+            | "where"
+            | "while"
+            | "async"
+            | "await"
+            | "dyn"
+            | "abstract"
+            | "become"
+            | "box"
+            | "do"
+            | "final"
+            | "macro"
+            | "override"
+            | "priv"
+            | "typeof"
+            | "unsized"
+            | "virtual"
+            | "yield"
+            | "try"
+    )
 }
