@@ -70,7 +70,7 @@ pub fn generate_configure(_input: TokenStream) -> TokenStream {
         // 自定义映射函数：过滤掉不需要出现在 URL 中的模块名
         fn map_module_segment(segment: &str) -> Option<&str> {
             match segment {
-                "handler" | "api" | "api_tool" => None, // 这些模块名不应出现在 URL 中
+                "crate" => None, // 这些模块名不应出现在 URL 中
                 _ => Some(segment),
             }
         }
@@ -401,28 +401,39 @@ fn scan_directory<P: AsRef<Path>>(
 /// 处理单个 .rs 文件，提取其中的路由函数信息
 fn process_file(path: &Path, base_module_path: &str, result: &mut Vec<RouteFunction>) {
     if let Ok(content) = fs::read_to_string(path) {
-        let mut current_module = base_module_path
+        // 构建 current_module：base + 文件路径中除 src/ 以外的所有组件
+        let mut current_module: Vec<String> = base_module_path
             .split("::")
             .filter(|s| !s.is_empty())
             .map(String::from)
-            .collect::<Vec<String>>();
+            .collect();
 
-        // 获取文件名（如 user.rs）
-        if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
-            if file_stem != "mod" && file_stem != "main" && file_stem != "lib" {
-                // 获取父目录名称（如 src/api/user.rs → user）
-                if let Some(parent) = path
-                    .parent()
-                    .and_then(|p| p.file_stem().and_then(|s| s.to_str()))
-                {
-                    current_module.push(parent.to_string());
+        // 获取文件所在目录的相对路径（相对于 src）
+        let src_root = path
+            .ancestors()
+            .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("src"))
+            .expect("Could not find 'src' directory");
+
+        let relative_path = path.strip_prefix(src_root).unwrap_or(path);
+
+        // 遍历路径组件，跳过文件名，保留目录部分
+        for component in relative_path.parent().unwrap_or(relative_path).components() {
+            if let std::path::Component::Normal(name) = component {
+                let name_str = name.to_str().unwrap();
+                if name_str != "mod" && name_str != "lib" && name_str != "main" {
+                    current_module.push(name_str.to_string());
                 }
+            }
+        }
 
-                // 添加当前文件名作为模块名
+        // 添加当前文件名作为模块名（排除 main.rs / lib.rs / mod.rs）
+        if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
+            if file_stem != "main" && file_stem != "lib" {
                 current_module.push(file_stem.to_string());
             }
         }
 
+        // 处理项
         for item in parse_file(&content)
             .expect("Failed to parse file content")
             .items

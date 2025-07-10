@@ -1,9 +1,11 @@
+// 必须这样引入宏
+#[macro_use]
+extern crate route_codegen;
 pub mod api;
 pub mod handler;
 use actix_web::{App, HttpServer};
-use route_codegen::generate_configure;
 
-// 生成 configure 函数
+// 使用宏生成 configure 函数
 generate_configure!();
 
 #[actix_web::main]
