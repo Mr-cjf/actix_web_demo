@@ -1,5 +1,7 @@
 extern crate proc_macro;
 
+// 导入函数
+mod tools;
 use proc_macro::TokenStream;
 use quote::quote;
 // 用于解析 Rust 源码为 AST
@@ -12,10 +14,11 @@ use std::fs;
 use std::io::Read;
 // 文件读取
 use std::path::{Path, PathBuf};
-// 路径处理
-use syn::LitStr;
 // 用于解析属性中的字符串字面量
 use syn::{parse_file, ItemFn};
+// 路径处理
+use syn::{LitStr, PathSegment, Token};
+use tools::is_rust_keyword;
 // 并行迭代支持
 
 /// generate_configure 是一个过程宏，它会扫描整个项目和 workspace 成员中的路由函数，
@@ -35,12 +38,27 @@ pub fn generate_configure(_input: TokenStream) -> TokenStream {
         );
     }
 
-    use std::collections::HashMap;
+    let grouped = group_functions_by_module(&functions);
+    let (all_configure_fns, all_configure_calls, all_routes) =
+        generate_configure_functions_and_routes(grouped);
 
-    // 按模块路径分组
+    let expanded = build_configure_function(all_configure_fns, all_configure_calls, all_routes);
+
+    #[cfg(debug_assertions)]
+    {
+        let generated_code = expanded.to_string();
+        println!("🧾 Generated code:\n{}", generated_code);
+    }
+
+    TokenStream::from(expanded)
+}
+
+/// 按模块路径分组
+fn group_functions_by_module(
+    functions: &[RouteFunction],
+) -> HashMap<Vec<String>, Vec<RouteFunction>> {
     let mut grouped: HashMap<Vec<String>, Vec<RouteFunction>> = HashMap::new();
     for func in functions {
-        // 将 module_prefix 拆分为模块层级列表
         let module_segments: Vec<String> = func
             .module_prefix
             .split("::")
@@ -51,111 +69,129 @@ pub fn generate_configure(_input: TokenStream) -> TokenStream {
         grouped
             .entry(module_segments)
             .or_insert_with(Vec::new)
-            .push(func);
+            .push(func.clone());
     }
+    grouped
+}
 
-    // 为每个模块生成 configure_xxx 函数
+/// 生成 configure_xxx 和 register_xxx 函数及路由信息
+fn generate_configure_functions_and_routes(
+    grouped: HashMap<Vec<String>, Vec<RouteFunction>>,
+) -> (
+    Vec<proc_macro2::TokenStream>,
+    Vec<syn::Ident>,
+    Vec<(String, String)>,
+) {
     let mut all_configure_fns = Vec::new();
-    let mut all_configure_calls: Vec<syn::Ident> = Vec::new();
-    // 新增：收集所有路由信息用于一次性打印
+    let mut all_configure_calls = Vec::new();
     let mut all_routes = Vec::new();
 
-    for (module_path, funcs) in grouped {
-        let safe_mod_name = module_path.join("_");
-        let configure_ident = syn::Ident::new(
-            &format!("configure_{}", safe_mod_name),
-            proc_macro2::Span::call_site(),
-        );
-
-        // 自定义映射函数：过滤掉不需要出现在 URL 中的模块名
-
-        let scope_name = module_path
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-            .join("/");
-
-        let mod_scope = if scope_name.is_empty() {
-            "/".to_string()
-        } else {
-            format!("/{}", scope_name)
-        };
-
-        let services = funcs.iter().map(|f| {
-            let ident = syn::Ident::new(&f.name, proc_macro2::Span::call_site());
-
-            // 构造模块路径，并处理关键字
-            let mut segments = syn::punctuated::Punctuated::new();
-            for s in f.module_prefix.split("::") {
-                // 使用 parse_str 构造合法的 Ident
-                let ident_segment = if is_rust_keyword(s) {
-                    syn::parse_str::<syn::Ident>(&format!("r#{}", s))
-                        .expect("Failed to parse raw identifier")
-                } else {
-                    syn::parse_str::<syn::Ident>(s).expect("Failed to parse identifier")
-                };
-                let path_segment = syn::PathSegment::from(ident_segment);
-                segments.push(path_segment);
-            }
-
-            let path = syn::Path {
-                leading_colon: None,
-                segments,
-            };
-
-            quote! {
-                cfg.service(#path::#ident);
-            }
-        });
-
-        // 收集路由信息
-        for f in &funcs {
-            let full_path = format!("{}{}", mod_scope, f.route_path);
-            all_routes.push((f.method.to_uppercase(), full_path));
-        }
-
-        let register_ident = syn::Ident::new(
-            &format!("register_{}", safe_mod_name),
-            proc_macro2::Span::call_site(),
-        );
-
-        // 👇 将日志语句插入到 register 函数体中
-        let register_fn = quote! {
-            pub fn #register_ident(cfg: &mut actix_web::web::ServiceConfig) {
-                #(#services)*
-            }
-        };
-
-        let configure_fn = quote! {
-            pub fn #configure_ident(cfg: &mut actix_web::web::ServiceConfig) {
-                cfg.service(actix_web::web::scope(#mod_scope)
-                    .configure(#register_ident));
-            }
-        };
-
+    for (module_path, functions) in grouped {
+        let (configure_fn, register_fn, calls, routes) =
+            generate_module_configure(&module_path, &functions);
         all_configure_fns.push(register_fn);
         all_configure_fns.push(configure_fn);
-        all_configure_calls.push(configure_ident);
+        all_configure_calls.extend(calls);
+        all_routes.extend(routes);
     }
 
-    // 创建路由日志的迭代器
+    (all_configure_fns, all_configure_calls, all_routes)
+}
+
+/// 为每个模块生成 configure/register 函数及相关内容
+fn generate_module_configure(
+    module_path: &[String],
+    functions: &[RouteFunction],
+) -> (
+    proc_macro2::TokenStream,
+    proc_macro2::TokenStream,
+    Vec<syn::Ident>,
+    Vec<(String, String)>,
+) {
+    let safe_mod_name = module_path.join("_");
+    let configure_ident = syn::Ident::new(
+        &format!("configure_{}", safe_mod_name),
+        proc_macro2::Span::call_site(),
+    );
+
+    let scope_name = module_path.join("/");
+    let mod_scope = if scope_name.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", scope_name)
+    };
+
+    let services = functions.iter().map(|f| {
+        let ident = syn::Ident::new(&f.name, proc_macro2::Span::call_site());
+
+        let mut segments = syn::punctuated::Punctuated::<PathSegment, Token![::]>::new();
+        for s in f.module_prefix.split("::") {
+            let ident_segment = if is_rust_keyword(s) {
+                syn::parse_str::<syn::Ident>(&format!("r#{}", s))
+                    .expect("Failed to parse raw identifier")
+            } else {
+                syn::parse_str::<syn::Ident>(s).expect("Failed to parse identifier")
+            };
+            let path_segment = syn::PathSegment::from(ident_segment);
+            segments.push(path_segment);
+        }
+
+        quote! {
+            cfg.service(#segments::#ident);
+        }
+    });
+
+    let register_ident = syn::Ident::new(
+        &format!("register_{}", safe_mod_name),
+        proc_macro2::Span::call_site(),
+    );
+
+    let register_fn = quote! {
+        pub fn #register_ident(cfg: &mut actix_web::web::ServiceConfig) {
+            #(#services)*
+        }
+    };
+
+    let configure_fn = quote! {
+        pub fn #configure_ident(cfg: &mut actix_web::web::ServiceConfig) {
+            cfg.service(actix_web::web::scope(#mod_scope)
+                .configure(#register_ident));
+        }
+    };
+
+    let routes = functions
+        .iter()
+        .map(|f| {
+            (
+                f.method.to_uppercase(),
+                format!("{}{}", mod_scope, f.route_path),
+            )
+        })
+        .collect();
+
+    (configure_fn, register_fn, vec![configure_ident], routes)
+}
+
+/// 构建最终的 configure 函数
+fn build_configure_function(
+    all_configure_fns: Vec<proc_macro2::TokenStream>,
+    all_configure_calls: Vec<syn::Ident>,
+    all_routes: Vec<(String, String)>,
+) -> proc_macro2::TokenStream {
     let route_logs = all_routes.iter().map(|(method, path)| {
         quote! {
             log::info!("🚀 Registered route: {} {}", #method, #path);
         }
     });
 
-    // 构建总入口 configure 函数
-    let expanded = quote! {
+    let configure_all = quote! {
         #(#all_configure_fns)*
 
         pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
-            // 一次性打印所有路由信息
             {
                 use std::sync::atomic::{AtomicBool, Ordering};
                 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-                // 确保只打印一次
                 if INITIALIZED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                     #(#route_logs)*
                 }
@@ -166,14 +202,8 @@ pub fn generate_configure(_input: TokenStream) -> TokenStream {
             )*
         }
     };
-    // 打印最终生成的代码字符串（用于调试）
-    #[cfg(debug_assertions)]
-    {
-        let generated_code = expanded.to_string();
-        println!("🧾 Generated code:\n{}", generated_code);
-    }
 
-    TokenStream::from(expanded)
+    configure_all
 }
 
 /// 扫描当前 crate 中所有的路由函数
@@ -256,27 +286,25 @@ fn scan_project(manifest_dir: &str, crate_root: &str, result: &mut Vec<RouteFunc
     // 计算基础模块路径
     let base_module_path = if crate_root == "crate" {
         let relative_path = root_dir.strip_prefix(&src_path).unwrap_or(root_dir);
-        let mut base = "crate".to_string();
-        for comp in relative_path.components() {
-            if let std::path::Component::Normal(name) = comp {
-                base.push_str("::");
-                base.push_str(name.to_str().unwrap());
-            }
-        }
-        base
+        build_module_path("crate", relative_path)
     } else {
         let relative_path = root_dir.strip_prefix(&src_path).unwrap_or(root_dir);
-        let mut base = crate_root.to_string(); // ✅ 正确写法
-        for comp in relative_path.components() {
-            if let std::path::Component::Normal(name) = comp {
-                base.push_str("::");
-                base.push_str(name.to_str().unwrap());
-            }
-        }
-        base
+        build_module_path(crate_root, relative_path)
     };
 
     scan_directory(root_dir, &[], &base_module_path, result);
+}
+
+/// 构建模块路径字符串
+fn build_module_path(base: &str, relative_path: &Path) -> String {
+    let mut result = base.to_string();
+    for comp in relative_path.components() {
+        if let std::path::Component::Normal(name) = comp {
+            result.push_str("::");
+            result.push_str(name.to_str().unwrap());
+        }
+    }
+    result
 }
 
 // 读取 Cargo.toml 中的 workspace 配置
@@ -389,48 +417,60 @@ fn scan_directory<P: AsRef<Path>>(
 
 /// 处理单个 .rs 文件，提取其中的路由函数信息
 fn process_file(path: &Path, base_module_path: &str, result: &mut Vec<RouteFunction>) {
-    if let Ok(content) = fs::read_to_string(path) {
-        let mut current_module: Vec<String> = base_module_path
-            .split("::")
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .collect();
-
-        // 获取文件所在目录的相对路径（相对于 src）
-        let src_root = path
-            .ancestors()
-            .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("src"))
-            .expect("Could not find 'src' directory");
-
-        let relative_path = path.strip_prefix(src_root).unwrap_or(path);
-
-        // 遍历路径组件，跳过文件名，保留目录部分
-        for component in relative_path.parent().unwrap_or(relative_path).components() {
-            if let std::path::Component::Normal(name) = component {
-                let name_str = name.to_str().unwrap();
-                if name_str != "main" {
-                    current_module.push(name_str.to_string());
-                }
-            }
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(_) => {
+            eprintln!("❌ Failed to read file: {}", path.display());
+            return;
         }
+    };
 
-        // 添加当前文件名作为模块名（排除 main.rs / lib.rs / mod.rs）
-        if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
-            // 如果是 lib.rs 或 main.rs，则不再添加文件名为模块名
-            if file_stem != "main" && file_stem != "lib" {
-                current_module.push(file_stem.to_string());
-            }
-        }
+    // 解析 AST 和当前模块路径
+    let mut current_module = build_current_module(base_module_path, path);
 
-        for item in parse_file(&content)
-            .expect("Failed to parse file content")
-            .items
-        {
-            process_item_with_module(&item, result, &mut current_module, path);
-        }
-    } else {
-        eprintln!("❌ Failed to read file: {}", path.display());
+    for item in parse_file(&content)
+        .expect("Failed to parse file content")
+        .items
+    {
+        process_item_with_module(&item, result, &mut current_module, path);
     }
+}
+
+/// 构建当前文件对应的模块路径
+fn build_current_module(base_module_path: &str, path: &Path) -> Vec<String> {
+    let src_root = find_src_directory(path).expect("Could not find 'src' directory");
+    let relative_path = path.strip_prefix(src_root).unwrap_or(path);
+
+    let mut current_module: Vec<String> = base_module_path
+        .split("::")
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+
+    // 添加目录部分作为模块路径
+    for component in relative_path.parent().unwrap_or(relative_path).components() {
+        if let std::path::Component::Normal(name) = component {
+            let name_str = name.to_str().unwrap();
+            if name_str != "main" {
+                current_module.push(name_str.to_string());
+            }
+        }
+    }
+
+    // 添加文件名作为模块名（排除 main.rs / lib.rs）
+    if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
+        if file_stem != "main" && file_stem != "lib" {
+            current_module.push(file_stem.to_string());
+        }
+    }
+
+    current_module
+}
+
+/// 查找包含 src 的根目录
+fn find_src_directory(path: &Path) -> Option<&Path> {
+    path.ancestors()
+        .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("src"))
 }
 
 fn process_item_with_module(
@@ -518,6 +558,7 @@ fn handle_module(
 }
 
 /// 表示一个发现的路由函数的信息
+#[derive(Clone)]
 struct RouteFunction {
     name: String,          // 函数名称
     method: String,        // HTTP 方法（如 get、post）
@@ -605,59 +646,4 @@ fn build_module_prefix(current_module: &[String]) -> String {
         .map(String::as_str)
         .collect();
     filtered.join("::")
-}
-
-fn is_rust_keyword(s: &str) -> bool {
-    matches!(
-        s,
-        "as" | "break"
-            | "const"
-            | "continue"
-            | "else"
-            | "enum"
-            | "extern"
-            | "false"
-            | "fn"
-            | "for"
-            | "if"
-            | "impl"
-            | "in"
-            | "let"
-            | "loop"
-            | "match"
-            | "mod"
-            | "move"
-            | "mut"
-            | "pub"
-            | "ref"
-            | "return"
-            | "self"
-            | "Self"
-            | "static"
-            | "struct"
-            | "super"
-            | "trait"
-            | "true"
-            | "type"
-            | "unsafe"
-            | "use"
-            | "where"
-            | "while"
-            | "async"
-            | "await"
-            | "dyn"
-            | "abstract"
-            | "become"
-            | "box"
-            | "do"
-            | "final"
-            | "macro"
-            | "override"
-            | "priv"
-            | "typeof"
-            | "unsized"
-            | "virtual"
-            | "yield"
-            | "try"
-    )
 }
