@@ -140,17 +140,12 @@ pub fn build_configure_function(
     // 生成 configure 调用
     let configure_calls = all_configure_calls.iter().map(|call| {
         quote! {
-
             cfg.configure(#call);
-
         }
     });
 
     let configure_all = quote! {
-        #(
-            #all_configure_fns
-
-        )*
+        #(#all_configure_fns)*
 
         pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
             {

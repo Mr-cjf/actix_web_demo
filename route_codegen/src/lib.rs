@@ -9,6 +9,7 @@ use crate::configure_builder::{
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use proc_macro::TokenStream;
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
@@ -42,71 +43,40 @@ impl syn::parse::Parse for ConfigureArgs {
 #[proc_macro]
 pub fn generate_configure(input: TokenStream) -> TokenStream {
     let functions = if input.is_empty() {
-        // 不传参数时直接调用传统扫描方法（自动识别路径）
-
-        scan_crate_for_route_functions()
+        scan_crate_for_route_functions().unwrap_or_else(|e| {
+            return syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!("Failed to scan crate for route functions: {}", e),
+            )
+            .to_compile_error()
+            .into();
+        })
     } else {
         let args = parse_macro_input!(input as ConfigureArgs);
-        // 添加默认排除规则
-        let default_exclude_patterns = vec!["!route_codegen/src/**"];
-
-        let mut all_patterns = args.patterns.clone();
-        all_patterns.extend(default_exclude_patterns.iter().cloned().map(String::from));
-        // 构建 include/exclude 规则
-        let (include_patterns, exclude_patterns) = split_include_exclude(&all_patterns);
-        let include_set =
-            build_glob_set(&include_patterns).expect("Failed to build include glob set");
-        let exclude_set =
-            build_glob_set(&exclude_patterns).expect("Failed to build exclude glob set");
-
-        let scan_rules = ScanRules {
-            include: include_set,
-            exclude: exclude_set,
-            include_patterns: include_patterns.clone(),
-            exclude_patterns: exclude_patterns.clone(),
-        };
-        println!(
-            "🔍 Scanning with rules: include_patterns {:?}  ",
-            &include_patterns
-        );
-
-        println!("🎯 Scan Rules:");
-        println!("✅ Include patterns:");
-        for pattern in &scan_rules.include_patterns {
-            println!(" - {}", pattern);
-        }
-
-        println!("❌ Exclude patterns:");
-        for pattern in &scan_rules.exclude_patterns {
-            println!(" - {}", pattern);
-        }
+        let scan_rules = build_scan_rules(&args.patterns);
+        log_scan_rules(&scan_rules);
 
         let files = scan_crate_for_route_files_with_rules(&scan_rules);
-        let mut result = Vec::new();
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
-        let src_path = PathBuf::from(manifest_dir).join("src");
+        let src_path = PathBuf::from(&manifest_dir).join("src");
 
+        let mut result = Vec::new();
         for file in files {
-            // 这里不再固定为 "crate"
             let base_module = if file.starts_with(&src_path) {
                 "crate".to_string()
             } else {
                 get_crate_name_from_path(&file).unwrap_or("unknown".to_string())
             };
 
-            process_file(&file, &base_module, &mut result);
+            if let Err(e) = process_file(&file, &base_module, &mut result) {
+                eprintln!("❌ Failed to process file {}: {}", file.display(), e);
+            }
         }
 
         result
     };
 
-    println!("🔍 Found {} route functions", functions.len());
-    for func in &functions {
-        println!(
-            " - {} [{} {}] (module: {:?})",
-            func.name, func.method, func.route_path, func.module_prefix
-        );
-    }
+    log_found_functions(&functions);
 
     let grouped = group_functions_by_module(&functions);
     let (all_configure_fns, all_configure_calls, all_routes) =
@@ -115,6 +85,49 @@ pub fn generate_configure(input: TokenStream) -> TokenStream {
     let expanded = build_configure_function(all_configure_fns, all_configure_calls, all_routes);
 
     TokenStream::from(expanded)
+}
+
+// 构建扫描规则
+fn build_scan_rules(patterns: &[String]) -> ScanRules {
+    let default_exclude_patterns = vec!["!route_codegen/src/**"];
+    let mut all_patterns = patterns.to_vec();
+    all_patterns.extend(default_exclude_patterns.iter().cloned().map(String::from));
+
+    let (include_patterns, exclude_patterns) = split_include_exclude(&all_patterns);
+    let include_set = build_glob_set(&include_patterns).expect("Failed to build include glob set");
+    let exclude_set = build_glob_set(&exclude_patterns).expect("Failed to build exclude glob set");
+
+    ScanRules {
+        include: include_set,
+        exclude: exclude_set,
+        include_patterns,
+        exclude_patterns,
+    }
+}
+
+// 打印扫描规则
+fn log_scan_rules(rules: &ScanRules) {
+    println!("🎯 Scan Rules:");
+    println!("✅ Include patterns:");
+    for pattern in &rules.include_patterns {
+        println!(" - {}", pattern);
+    }
+
+    println!("❌ Exclude patterns:");
+    for pattern in &rules.exclude_patterns {
+        println!(" - {}", pattern);
+    }
+}
+
+// 打印找到的路由函数
+fn log_found_functions(functions: &[RouteFunction]) {
+    println!("🔍 Found {} route functions", functions.len());
+    for func in functions {
+        println!(
+            " - {} [{} {}] (module: {:?})",
+            func.name, func.method, func.route_path, func.module_prefix
+        );
+    }
 }
 
 fn split_include_exclude(patterns: &[String]) -> (Vec<String>, Vec<String>) {
@@ -244,28 +257,28 @@ fn should_skip_file(file_path: &Path, manifest_dir: &str, rules: &ScanRules) -> 
 
     let rel_path = file_path.strip_prefix(manifest_dir).unwrap_or(&file_path);
 
-    !rules.should_include(normalize_path(&rel_path))
+    !rules.should_include(&*normalize_path(&rel_path))
 }
 
 /// 扫描当前 crate 中所有的路由函数
-fn scan_crate_for_route_functions() -> Vec<RouteFunction> {
+fn scan_crate_for_route_functions() -> Result<Vec<RouteFunction>, String> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR environment variable not found");
+        .map_err(|_| "CARGO_MANIFEST_DIR environment variable not found".to_string())?;
 
     let mut result = Vec::new();
 
     // 扫描主项目，使用 "crate" 作为根
-    scan_project(&manifest_dir, "crate", &mut result);
+    scan_project(&manifest_dir, "crate", &mut result)?;
 
     // 扫描工作空间成员
     if let Some(workspace_config) = read_workspace_config(&manifest_dir) {
         if let Some(members) = workspace_config.members {
             let workspace_dir = PathBuf::from(&manifest_dir);
-            scan_workspace_members(workspace_dir, members, &mut result);
+            scan_workspace_members(workspace_dir, members, &mut result)?;
         }
     }
 
-    result
+    Ok(result)
 }
 
 /// 遍历 workspace 成员并扫描每个成员项目的源码
@@ -273,7 +286,7 @@ fn scan_workspace_members(
     workspace_dir: PathBuf,
     members: Vec<String>,
     result: &mut Vec<RouteFunction>,
-) {
+) -> Result<(), String> {
     for member in members {
         let member_dir = workspace_dir.join(&member);
         if !member_dir.exists() {
@@ -288,9 +301,10 @@ fn scan_workspace_members(
         // 读取成员项目的包名
         if let Some(package_name) = read_package_name(&member_manifest_path) {
             let member_manifest_dir = member_dir.to_str().unwrap().to_string();
-            scan_project(&member_manifest_dir, &package_name, result);
+            scan_project(&member_manifest_dir, &package_name, result)?;
         }
     }
+    Ok(())
 }
 
 // 新增函数：读取 Cargo.toml 中的包名
@@ -308,21 +322,20 @@ fn read_package_name(manifest_path: &Path) -> Option<String> {
 }
 
 /// 扫描指定项目的 src/ 目录下的所有路由函数
-fn scan_project(manifest_dir: &str, crate_root: &str, result: &mut Vec<RouteFunction>) {
+fn scan_project(
+    manifest_dir: &str,
+    crate_root: &str,
+    result: &mut Vec<RouteFunction>,
+) -> Result<(), String> {
     let src_path = PathBuf::from(manifest_dir).join("src");
 
     let main_or_lib_path = match find_main_or_lib(&src_path) {
         Some(path) => path,
-        None => return,
+        None => return Ok(()),
     };
 
     // 主文件所在目录
     let root_dir = main_or_lib_path.parent().unwrap_or(&src_path);
-
-    match find_main_or_lib(&src_path) {
-        Some(path) => path,
-        None => return,
-    };
 
     // 计算基础模块路径
     let base_module_path = if crate_root == "crate" {
@@ -333,7 +346,8 @@ fn scan_project(manifest_dir: &str, crate_root: &str, result: &mut Vec<RouteFunc
         build_module_path(crate_root, relative_path)
     };
 
-    scan_directory(root_dir, &[], &base_module_path, result);
+    scan_directory(root_dir, &[], &base_module_path, result)?;
+    Ok(())
 }
 
 /// 构建模块路径字符串
@@ -409,61 +423,90 @@ fn scan_directory<P: AsRef<Path>>(
     exclude_files: &[&str],
     base_module_path: &str,
     result: &mut Vec<RouteFunction>,
-) {
+) -> Result<(), String> {
     let path = path.as_ref();
+
     #[cfg(debug_assertions)]
     println!("📁 Scanning directory: {:?}", path);
 
-    if let Ok(entries) = fs::read_dir(path) {
-        let entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries.filter_map(|e| e.ok()).collect::<Vec<_>>(),
+        Err(_) => return Ok(()),
+    };
 
-        let local_results: Vec<_> = entries
-            .into_par_iter()
-            .filter_map(|entry| {
-                let entry_path = entry.path();
-                let file_name = entry_path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
+    let local_results = entries
+        .into_par_iter()
+        .filter_map(|entry| {
+            let entry_path = entry.path();
+            let file_name = entry_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
 
-                if entry_path.is_file() {
-                    let ext = entry_path.extension().and_then(|s| s.to_str());
-                    if ext == Some("rs") && !exclude_files.contains(&file_name) {
-                        println!("🔍 Processing file: {:?}", entry_path);
-                        println!("📦 Base module path: {}", base_module_path);
-                        let mut sub_result = Vec::new();
-                        process_file(&entry_path, base_module_path, &mut sub_result);
-                        return Some(sub_result);
-                    }
-                } else if entry_path.is_dir() {
-                    let mut sub_result = Vec::new();
-                    scan_directory(
-                        &entry_path,
-                        exclude_files,
-                        base_module_path, // 传递 base_module_path
-                        &mut sub_result,
-                    );
-                    return Some(sub_result);
-                }
-
+            if entry_path.is_file() {
+                handle_file(&entry_path, file_name, exclude_files, base_module_path)
+            } else if entry_path.is_dir() {
+                handle_directory(&entry_path, base_module_path, exclude_files)
+            } else {
                 None
-            })
-            .flatten()
-            .collect();
+            }
+        })
+        .flatten()
+        .collect();
 
-        result.extend(local_results);
-    } else {
-        eprintln!("❌ Failed to read directory: {:?}", path);
+    result.extend(local_results);
+    Ok(())
+}
+
+/// 处理单个文件项
+fn handle_file(
+    entry_path: &Path,
+    file_name: &str,
+    exclude_files: &[&str],
+    base_module_path: &str,
+) -> Option<Vec<RouteFunction>> {
+    let ext = entry_path.extension().and_then(|s| s.to_str());
+    if ext != Some("rs") || exclude_files.contains(&file_name) {
+        return None;
     }
+
+    println!("🔍 Processing file: {:?}", entry_path);
+    println!("📦 Base module path: {}", base_module_path);
+
+    let mut sub_result = Vec::new();
+    process_file(entry_path, base_module_path, &mut sub_result).ok()?;
+    Some(sub_result)
+}
+
+/// 处理单个目录项
+fn handle_directory(
+    entry_path: &Path,
+    base_module_path: &str,
+    exclude_files: &[&str],
+) -> Option<Vec<RouteFunction>> {
+    let mut sub_result = Vec::new();
+    scan_directory(entry_path, exclude_files, base_module_path, &mut sub_result).ok()?;
+    Some(sub_result)
 }
 
 /// 处理单个 .rs 文件，提取其中的路由函数信息
-fn process_file(path: &Path, base_module_path: &str, result: &mut Vec<RouteFunction>) {
+fn process_file(
+    path: &Path,
+    base_module_path: &str,
+    result: &mut Vec<RouteFunction>,
+) -> Result<(), String> {
+    // 限制最大文件大小为10MB
+    const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+    let metadata = fs::metadata(path).map_err(|e| format!("Failed to get file metadata: {}", e))?;
+    if metadata.len() > MAX_FILE_SIZE {
+        return Err(format!("File size exceeds limit: {}", path.display()));
+    }
+
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
-        Err(_) => {
+        Err(e) => {
             eprintln!("❌ Failed to read file: {}", path.display());
-            return;
+            return Err(format!("Failed to read file: {}", e));
         }
     };
 
@@ -471,11 +514,12 @@ fn process_file(path: &Path, base_module_path: &str, result: &mut Vec<RouteFunct
     let mut current_module = build_current_module(base_module_path, path);
 
     for item in parse_file(&content)
-        .expect("Failed to parse file content")
+        .map_err(|e| format!("Failed to parse file content: {}", e))?
         .items
     {
         process_item_with_module(&item, result, &mut current_module, path);
     }
+    Ok(())
 }
 
 /// 构建当前文件对应的模块路径
@@ -543,7 +587,7 @@ fn handle_function(
     let module_prefix = build_module_prefix(current_module);
 
     let mut fixed_route_fn = route_fn;
-    fixed_route_fn.module_prefix = module_prefix;
+    fixed_route_fn.module_prefix = module_prefix.to_string();
 
     result.push(fixed_route_fn);
 }
@@ -654,12 +698,14 @@ fn is_route_attribute(attr: &syn::Attribute) -> bool {
 /// 解析路由属性宏的方法和路径
 fn parse_route_attribute(attr: &syn::Attribute) -> Option<(String, String)> {
     let key = get_attr_key(attr)?;
-    let attr_path = attr.parse_args::<LitStr>().ok()?;
-    let value = attr_path.value();
     METHOD_MAP
         .iter()
         .find(|&&(k, _)| k == key)
-        .map(|&(_, v)| (v.to_string(), value))
+        .and_then(|&(_, v)| {
+            attr.parse_args::<LitStr>()
+                .map(|attr_path| (v.to_string(), attr_path.value()))
+                .ok()
+        })
 }
 
 /// 提取属性宏的标识符名称
@@ -673,23 +719,47 @@ fn get_attr_key(attr: &syn::Attribute) -> Option<String> {
 }
 
 /// 构建模块前缀字符串
-fn build_module_prefix(current_module: &[String]) -> String {
-    let filtered: Vec<&str> = current_module
-        .iter()
-        .filter(|s| !matches!(s.as_str(), "crate" | "mod"))
-        .map(String::as_str)
-        .collect();
-    filtered.join("::")
+fn build_module_prefix(current_module: &[String]) -> Cow<'_, str> {
+    let mut result = String::new();
+    let mut first = true;
+
+    for s in current_module {
+        match s.as_str() {
+            "crate" | "mod" => continue,
+            _ => {
+                if !first {
+                    result.push_str("::");
+                }
+                result.push_str(s);
+                first = false;
+            }
+        }
+    }
+
+    Cow::Owned(result)
 }
 /// 将路径标准化为 Unix 风格（使用 '/' 分隔符）
-fn normalize_path<P: AsRef<Path>>(path: P) -> &'static str {
+fn normalize_path<P: AsRef<Path>>(path: &P) -> Cow<'_, str> {
     let path_str = path.as_ref().to_str().unwrap_or_default();
-    path_str.replace("\\", "/").leak()
+    if path_str.contains('\\') {
+        Cow::Owned(path_str.replace("\\", "/"))
+    } else {
+        Cow::Borrowed(path_str)
+    }
 }
 
 fn get_crate_name_from_path(path: &Path) -> Option<String> {
+    // 限制最大向上查找层级为10
+    const MAX_PARENT_LEVELS: usize = 10;
+
     let mut current = path.canonicalize().ok()?;
+    let mut levels = 0;
+
     loop {
+        if levels > MAX_PARENT_LEVELS {
+            break;
+        }
+
         if current.join("Cargo.toml").exists() {
             let manifest_path = current.join("Cargo.toml");
             return read_package_name(&manifest_path);
@@ -700,6 +770,7 @@ fn get_crate_name_from_path(path: &Path) -> Option<String> {
             break;
         }
         current = parent.to_path_buf();
+        levels += 1;
     }
     None
 }
