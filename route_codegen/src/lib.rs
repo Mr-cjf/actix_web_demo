@@ -43,14 +43,17 @@ impl syn::parse::Parse for ConfigureArgs {
 #[proc_macro]
 pub fn generate_configure(input: TokenStream) -> TokenStream {
     let functions = if input.is_empty() {
-        scan_crate_for_route_functions().unwrap_or_else(|e| {
-            return syn::Error::new(
-                proc_macro2::Span::call_site(),
-                format!("Failed to scan crate for route functions: {}", e),
-            )
-            .to_compile_error()
-            .into();
-        })
+        match scan_crate_for_route_functions() {
+            Ok(fns) => fns,
+            Err(e) => {
+                return syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    format!("Failed to scan crate for route functions: {}", e),
+                )
+                .to_compile_error()
+                .into();
+            }
+        }
     } else {
         let args = parse_macro_input!(input as ConfigureArgs);
         let scan_rules = build_scan_rules(&args.patterns);
@@ -434,7 +437,7 @@ fn scan_directory<P: AsRef<Path>>(
         Err(_) => return Ok(()),
     };
 
-    let local_results = entries
+    let local_results: Vec<RouteFunction> = entries
         .into_par_iter()
         .filter_map(|entry| {
             let entry_path = entry.path();
