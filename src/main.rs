@@ -3,11 +3,16 @@
 extern crate route_codegen;
 pub mod api;
 pub mod handler;
-use actix_web::{App, HttpServer};
+use actix_web::{get, App, HttpResponse, HttpServer};
+
+#[get("/11122")]
+pub async fn hello1111() -> HttpResponse {
+    HttpResponse::Ok().body("Hello from auto_route!")
+}
 
 // 使用宏生成 configure 函数
-generate_configure!();
-
+generate_configure!("**/src/**/*.rs");
+// generate_configure!();
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     // 初始化日志系统

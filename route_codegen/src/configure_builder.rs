@@ -90,23 +90,25 @@ fn generate_module_configure(
             cfg.service(#segments::#ident);
         }
     });
-
     let register_ident = Ident::new(
         &format!("register_{}", safe_mod_name),
         proc_macro2::Span::call_site(),
     );
 
     let register_fn = quote! {
+
         pub fn #register_ident(cfg: &mut actix_web::web::ServiceConfig) {
             #(#services)*
         }
+
     };
 
     let configure_fn = quote! {
+
         pub fn #configure_ident(cfg: &mut actix_web::web::ServiceConfig) {
-            cfg.service(actix_web::web::scope(#mod_scope)
-                .configure(#register_ident));
+            cfg.service(actix_web::web::scope(#mod_scope).configure(#register_ident));
         }
+
     };
 
     let routes = functions
@@ -128,14 +130,27 @@ pub fn build_configure_function(
     all_configure_calls: Vec<Ident>,
     all_routes: Vec<(String, String)>,
 ) -> proc_macro2::TokenStream {
+    // 生成日志
     let route_logs = all_routes.iter().map(|(method, path)| {
         quote! {
             log::info!("🚀 Registered route: {} {}", #method, #path);
         }
     });
 
+    // 生成 configure 调用
+    let configure_calls = all_configure_calls.iter().map(|call| {
+        quote! {
+
+            cfg.configure(#call);
+
+        }
+    });
+
     let configure_all = quote! {
-        #(#all_configure_fns)*
+        #(
+            #all_configure_fns
+
+        )*
 
         pub fn configure(cfg: &mut actix_web::web::ServiceConfig) {
             {
@@ -147,11 +162,21 @@ pub fn build_configure_function(
                 }
             }
 
-            #(
-                cfg.configure(#all_configure_calls);
-            )*
+            #(#configure_calls)*
         }
     };
-
+    // 调用格式化函数打印输出
+    format_token_stream(&configure_all);
+    // 调用格式化函数
     configure_all
+}
+
+fn format_token_stream(stream: &proc_macro2::TokenStream) {
+    let code = stream.to_string();
+
+    // 使用 syn 解析代码
+    let syntax_tree = syn::parse_file(&code).expect("Failed to parse code");
+    // 使用 prettyplease 格式化
+    let formatted_code = prettyplease::unparse(&syntax_tree);
+    println!("formatting code \n{}", formatted_code);
 }

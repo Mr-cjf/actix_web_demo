@@ -1,28 +1,38 @@
 extern crate proc_macro;
 
-// 导入函数
 mod configure_builder;
 mod tools;
 
-// 路径处理
 use crate::configure_builder::{
     build_configure_function, generate_configure_functions_and_routes, group_functions_by_module,
 };
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use proc_macro::TokenStream;
-// 用于解析 Rust 源码为 AST
 use rayon::prelude::*;
-// 用于生成 Rust 代码的宏
 use std::collections::HashMap;
-// 解析 Cargo.toml 使用
 use std::fs;
-// 文件系统操作
 use std::io::Read;
-// 文件读取
 use std::path::{Path, PathBuf};
-use syn::LitStr;
-// 用于解析属性中的字符串字面量
-use syn::{parse_file, ItemFn};
-// 并行迭代支持
+use syn::{parse_file, parse_macro_input, ItemFn, LitStr};
+
+#[derive(Debug)]
+struct ConfigureArgs {
+    patterns: Vec<String>,
+}
+
+impl syn::parse::Parse for ConfigureArgs {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let mut patterns = Vec::new();
+        while !input.is_empty() {
+            let path: LitStr = input.parse()?;
+            patterns.push(path.value());
+            if !input.is_empty() {
+                let _: syn::Token![,] = input.parse()?;
+            }
+        }
+        Ok(ConfigureArgs { patterns })
+    }
+}
 
 /// generate_configure 是一个过程宏，它会扫描整个项目和 workspace 成员中的路由函数，
 /// 然后自动生成 configure 函数来注册这些路由。
@@ -30,8 +40,65 @@ use syn::{parse_file, ItemFn};
 /// 它是通过 #[proc_macro] 注册的过程宏，供其他模块使用：
 ///
 #[proc_macro]
-pub fn generate_configure(_input: TokenStream) -> TokenStream {
-    let functions = scan_crate_for_route_functions();
+pub fn generate_configure(input: TokenStream) -> TokenStream {
+    let functions = if input.is_empty() {
+        // 不传参数时直接调用传统扫描方法（自动识别路径）
+
+        scan_crate_for_route_functions()
+    } else {
+        let args = parse_macro_input!(input as ConfigureArgs);
+        // 添加默认排除规则
+        let default_exclude_patterns = vec!["!route_codegen/src/**"];
+
+        let mut all_patterns = args.patterns.clone();
+        all_patterns.extend(default_exclude_patterns.iter().cloned().map(String::from));
+        // 构建 include/exclude 规则
+        let (include_patterns, exclude_patterns) = split_include_exclude(&all_patterns);
+        let include_set =
+            build_glob_set(&include_patterns).expect("Failed to build include glob set");
+        let exclude_set =
+            build_glob_set(&exclude_patterns).expect("Failed to build exclude glob set");
+
+        let scan_rules = ScanRules {
+            include: include_set,
+            exclude: exclude_set,
+            include_patterns: include_patterns.clone(),
+            exclude_patterns: exclude_patterns.clone(),
+        };
+        println!(
+            "🔍 Scanning with rules: include_patterns {:?}  ",
+            &include_patterns
+        );
+
+        println!("🎯 Scan Rules:");
+        println!("✅ Include patterns:");
+        for pattern in &scan_rules.include_patterns {
+            println!(" - {}", pattern);
+        }
+
+        println!("❌ Exclude patterns:");
+        for pattern in &scan_rules.exclude_patterns {
+            println!(" - {}", pattern);
+        }
+
+        let files = scan_crate_for_route_files_with_rules(&scan_rules);
+        let mut result = Vec::new();
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+        let src_path = PathBuf::from(manifest_dir).join("src");
+
+        for file in files {
+            // 这里不再固定为 "crate"
+            let base_module = if file.starts_with(&src_path) {
+                "crate".to_string()
+            } else {
+                get_crate_name_from_path(&file).unwrap_or("unknown".to_string())
+            };
+
+            process_file(&file, &base_module, &mut result);
+        }
+
+        result
+    };
 
     println!("🔍 Found {} route functions", functions.len());
     for func in &functions {
@@ -47,13 +114,137 @@ pub fn generate_configure(_input: TokenStream) -> TokenStream {
 
     let expanded = build_configure_function(all_configure_fns, all_configure_calls, all_routes);
 
-    #[cfg(debug_assertions)]
-    {
-        let generated_code = expanded.to_string();
-        println!("🧾 Generated code:\n{}", generated_code);
+    TokenStream::from(expanded)
+}
+
+fn split_include_exclude(patterns: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut include = Vec::new();
+    let mut exclude = Vec::new();
+
+    for pattern in patterns {
+        if pattern.starts_with('!') {
+            exclude.push(pattern[1..].to_string());
+        } else {
+            include.push(pattern.clone());
+        }
     }
 
-    TokenStream::from(expanded)
+    (include, exclude)
+}
+
+fn build_glob_set(patterns: &[String]) -> Result<GlobSet, globset::Error> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = Glob::new(pattern)?;
+        builder.add(glob);
+    }
+    Ok(builder.build()?)
+}
+
+#[derive(Debug)]
+struct ScanRules {
+    include: GlobSet,
+    exclude: GlobSet,
+    include_patterns: Vec<String>, // 新增字段
+    exclude_patterns: Vec<String>, // 新增字段
+}
+
+impl ScanRules {
+    fn should_include(&self, path: &str) -> bool {
+        self.include.is_match(path) && !self.exclude.is_match(path)
+    }
+}
+
+fn scan_crate_for_route_files_with_rules(rules: &ScanRules) -> Vec<PathBuf> {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let mut result = Vec::new();
+
+    // 主项目使用 "crate" 作为根路径
+    scan_project_files_with_rules(&manifest_dir, rules, &mut result, &manifest_dir);
+
+    if let Some(workspace_config) = read_workspace_config(&manifest_dir) {
+        if let Some(members) = workspace_config.members {
+            let workspace_dir = PathBuf::from(&manifest_dir);
+            for member in members {
+                let member_dir = workspace_dir.join(&member);
+                if member_dir.exists() {
+                    scan_project_files_with_rules(
+                        &member_dir.to_str().unwrap(),
+                        rules,
+                        &mut result,
+                        &manifest_dir,
+                    );
+                }
+            }
+        }
+    }
+
+    result
+}
+
+fn scan_project_files_with_rules(
+    manifest_dir: &str,
+    rules: &ScanRules,
+    result: &mut Vec<PathBuf>,
+    main_dir: &str,
+) {
+    let src_path = PathBuf::from(manifest_dir).join("src");
+
+    let main_or_lib_path = match find_main_or_lib(&src_path) {
+        Some(p) => p,
+        None => return,
+    };
+    println!("📦 Scanning manifest_dir: {:?}", manifest_dir);
+    let root_dir = main_or_lib_path.parent().unwrap_or(&src_path);
+    scan_directory_files_with_rules(root_dir, rules, result, main_dir)
+}
+
+fn scan_directory_files_with_rules<P: AsRef<Path>>(
+    path: P,
+    rules: &ScanRules,
+    result: &mut Vec<PathBuf>,
+    manifest_dir: &str,
+) {
+    let path = path.as_ref();
+
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.filter_map(|e| e.ok()) {
+        let entry_path = entry.path();
+        if should_skip_file(&entry_path, manifest_dir, rules) {
+            continue;
+        }
+        println!("🔍 有效扫描路径 Scanning {:?}", entry_path);
+        if entry_path.is_dir() {
+            scan_directory_files_with_rules(&entry_path, rules, result, manifest_dir);
+        } else {
+            result.push(entry_path);
+        }
+    }
+}
+
+/// 判断是否跳过该文件
+fn should_skip_file(file_path: &Path, manifest_dir: &str, rules: &ScanRules) -> bool {
+    if !file_path.is_file() {
+        return false;
+    }
+
+    let ext = file_path.extension().and_then(|s| s.to_str());
+    if ext != Some("rs") {
+        return true;
+    }
+
+    let file_name = file_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if file_name == "main.rs" {
+        return true;
+    }
+
+    let rel_path = file_path.strip_prefix(manifest_dir).unwrap_or(&file_path);
+
+    !rules.should_include(normalize_path(&rel_path))
 }
 
 /// 扫描当前 crate 中所有的路由函数
@@ -154,6 +345,7 @@ fn build_module_path(base: &str, relative_path: &Path) -> String {
             result.push_str(name.to_str().unwrap());
         }
     }
+    println!("📦 Scanning module: {:?}", result);
     result
 }
 
@@ -237,14 +429,14 @@ fn scan_directory<P: AsRef<Path>>(
                 if entry_path.is_file() {
                     let ext = entry_path.extension().and_then(|s| s.to_str());
                     if ext == Some("rs") && !exclude_files.contains(&file_name) {
+                        println!("🔍 Processing file: {:?}", entry_path);
+                        println!("📦 Base module path: {}", base_module_path);
                         let mut sub_result = Vec::new();
-                        // 修复1：添加 base_module_path 参数
                         process_file(&entry_path, base_module_path, &mut sub_result);
                         return Some(sub_result);
                     }
                 } else if entry_path.is_dir() {
                     let mut sub_result = Vec::new();
-                    // 修复2：添加 base_module_path 参数
                     scan_directory(
                         &entry_path,
                         exclude_files,
@@ -379,10 +571,7 @@ fn handle_module(
     // 再推入模块名（支持嵌套，例如 crate::handler::agency）
     current_module.push(module_name.clone());
 
-    println!(
-        "📁 Entering module '{}', stack: {:?}",
-        module_name, current_module
-    );
+    println!("📁 路由模块 '{}', stack: {:?}", module_name, current_module);
 
     // 处理模块内的项
     if let Some((_, ref items)) = module.content {
@@ -400,11 +589,6 @@ fn handle_module(
             current_module.pop(); // 弹出文件名
         }
     }
-
-    println!(
-        "🚪 Leaving module '{}', stack now: {:?}",
-        module_name, current_module
-    );
 }
 
 /// 表示一个发现的路由函数的信息
@@ -496,4 +680,26 @@ fn build_module_prefix(current_module: &[String]) -> String {
         .map(String::as_str)
         .collect();
     filtered.join("::")
+}
+/// 将路径标准化为 Unix 风格（使用 '/' 分隔符）
+fn normalize_path<P: AsRef<Path>>(path: P) -> &'static str {
+    let path_str = path.as_ref().to_str().unwrap_or_default();
+    path_str.replace("\\", "/").leak()
+}
+
+fn get_crate_name_from_path(path: &Path) -> Option<String> {
+    let mut current = path.canonicalize().ok()?;
+    loop {
+        if current.join("Cargo.toml").exists() {
+            let manifest_path = current.join("Cargo.toml");
+            return read_package_name(&manifest_path);
+        }
+
+        let parent = current.parent()?;
+        if parent == current {
+            break;
+        }
+        current = parent.to_path_buf();
+    }
+    None
 }
