@@ -4,10 +4,11 @@ extern crate route_codegen;
 pub mod api;
 pub mod handler;
 use actix_web::{get, App, HttpResponse, HttpServer};
+use log::info;
 
-#[get("/11122")]
-pub async fn hello1111() -> HttpResponse {
-    HttpResponse::Ok().body("Hello from auto_route!")
+#[get("/health")]
+async fn health() -> HttpResponse {
+    HttpResponse::Ok().finish()
 }
 
 // 使用宏生成 configure 函数
@@ -17,17 +18,17 @@ generate_configure!("**/src/**/*.rs");
 async fn main() -> std::io::Result<()> {
     // 初始化日志系统
     env_logger::init();
-
+    info!("🚀 正在启动 Web 服务，监听地址： 0.0.0.0:8080");
     // 设置 RUST_LOG（可选）
     unsafe {
         std::env::set_var("RUST_LOG", "web_demo=info");
     }
 
-    println!("Starting HTTP server at http://127.0.0.1:8080");
+    println!("Starting HTTP server at http:// 0.0.0.0:8080");
 
     // 启动服务，并注册共享状态
-    HttpServer::new(move || App::new().configure(configure))
-        .bind("127.0.0.1:8080")?
+    HttpServer::new(move || App::new().configure(configure).service(health))
+        .bind("0.0.0.0:8080")?
         .run()
         .await
 }

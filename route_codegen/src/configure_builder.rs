@@ -161,12 +161,12 @@ pub fn build_configure_function(
         }
     };
     // 调用格式化函数打印输出
-    format_token_stream(&configure_all);
+    // format_token_stream(&configure_all);
     // 调用格式化函数
     configure_all
 }
 
-fn format_token_stream(stream: &proc_macro2::TokenStream) {
+/*fn format_token_stream(stream: &proc_macro2::TokenStream) {
     let code = stream.to_string();
 
     // 使用 syn 解析代码
@@ -174,4 +174,4 @@ fn format_token_stream(stream: &proc_macro2::TokenStream) {
     // 使用 prettyplease 格式化
     let formatted_code = prettyplease::unparse(&syntax_tree);
     println!("formatting code \n{}", formatted_code);
-}
+}*/
