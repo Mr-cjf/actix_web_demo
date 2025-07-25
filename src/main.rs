@@ -8,7 +8,8 @@ use log::info;
 
 #[get("/health")]
 async fn health() -> HttpResponse {
-    HttpResponse::Ok().finish()
+    info!("health check");
+    HttpResponse::Ok().body("health check")
 }
 
 // 使用宏生成 configure 函数
@@ -24,10 +25,8 @@ async fn main() -> std::io::Result<()> {
         std::env::set_var("RUST_LOG", "web_demo=info");
     }
 
-    println!("Starting HTTP server at http:// 0.0.0.0:8080");
-
     // 启动服务，并注册共享状态
-    HttpServer::new(move || App::new().configure(configure).service(health))
+    HttpServer::new(move || App::new().service(health).configure(configure))
         .bind("0.0.0.0:8080")?
         .run()
         .await

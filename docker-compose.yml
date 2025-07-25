@@ -1,13 +1,15 @@
 services:
   web_demo:
     image: web_demo:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
-      - "8980:8080"
+      - "8080"
     environment:
       RUST_LOG: "web_demo=info,actix_web=info"
-    #    healthcheck:
-    #      test: [ "CMD", "curl", "-f", "http://localhost:8080/health" ]
-    #      interval: 5s
-    #      timeout: 2s
-    #      retries: 3
-    restart: unless-stopped
+    networks:
+      web_demo_network:
+
+networks:
+  web_demo_network:
